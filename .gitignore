@@ -4,3 +4,5 @@ sample.db
 output/
 Policies.txt
 __pycache__/
+evaluation/
+benchmark.py
