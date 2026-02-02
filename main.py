@@ -20,7 +20,7 @@ def main():
     logger = Logger(settings.LOG_DIR)
     file_manager = FileManager(settings.OUTPUT_DIR)
     
-    logger.log_system("Starting secure NL-SQL agent")
+    logger.log_system("Starting NL-SQL")
     
     db_connector = DatabaseConnector(settings.DB_CONFIG, logger)
     connection = db_connector.connect()
@@ -44,7 +44,7 @@ def main():
     sql_agent = SQLAgent(settings, logger, schema_text)
     insight_agent = InsightAgent(settings, logger)
     
-    print("Secure NL-SQL Agent Ready")
+    print("NL-SQL Ready")
     print("Enter your query (or 'exit' to quit):")
     
     while True:
@@ -112,7 +112,7 @@ def main():
             file_manager.save_insights(user_input, results, insights)
     
     db_connector.close()
-    logger.log_system("Agent shutdown")
+    logger.log_system("Shutdown")
 
 if __name__ == "__main__":
     main()
