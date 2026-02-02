@@ -1,0 +1,10 @@
+database_specific_policies:
+  allowed_tables: []
+  
+  restricted_columns: []
+  
+  require_filters_for_tables: []
+  
+  max_join_depth: 3
+  
+  custom_rules: []
