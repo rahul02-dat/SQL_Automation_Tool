@@ -23,4 +23,5 @@ Filters: {filters}
 
 Generate the appropriate SELECT query (or queries) to fulfill this request.
 Return each query on a new line starting with SELECT.
+Fine Tune the prompt request for the user itself and if the user is giving no values take the default value and give the output.
 Do not include markdown formatting or code blocks.
