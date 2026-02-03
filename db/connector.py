@@ -88,6 +88,7 @@ class DatabaseConnector:
                 order_date TEXT,
                 total_amount REAL,
                 status TEXT,
+                salesman TEXT,
                 FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
             )
         ''')
@@ -124,15 +125,15 @@ class DatabaseConnector:
         cursor.executemany('INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?)', customers_data)
         
         orders_data = [
-            (1, 1, '2024-06-01', 150.00, 'completed'),
-            (2, 1, '2024-06-15', 200.00, 'completed'),
-            (3, 2, '2024-06-10', 75.00, 'completed'),
-            (4, 3, '2024-06-20', 300.00, 'pending'),
-            (5, 4, '2024-07-01', 125.00, 'completed'),
-            (6, 5, '2024-07-05', 400.00, 'completed'),
-            (7, 1, '2024-07-10', 180.00, 'pending')
+            (1, 1, '2024-06-01', 150.00, 'completed', 'Alice Thompson'),
+            (2, 1, '2024-06-15', 200.00, 'completed', 'Bob Martinez'),
+            (3, 2, '2024-06-10', 75.00, 'completed', 'Alice Thompson'),
+            (4, 3, '2024-06-20', 300.00, 'pending', 'Carol Chen'),
+            (5, 4, '2024-07-01', 125.00, 'completed', 'David Rodriguez'),
+            (6, 5, '2024-07-05', 400.00, 'completed', 'Eve Johnson'),
+            (7, 1, '2024-07-10', 180.00, 'pending', 'Bob Martinez')
         ]
-        cursor.executemany('INSERT INTO orders VALUES (?, ?, ?, ?, ?)', orders_data)
+        cursor.executemany('INSERT INTO orders VALUES (?, ?, ?, ?, ?, ?)', orders_data)
         
         products_data = [
             (1, 'Laptop', 'Electronics', 999.99, 50),
