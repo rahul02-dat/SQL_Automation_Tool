@@ -505,9 +505,3 @@ There is currently 1 customer from the USA: John Smith ...
 [2024-07-15 14:32:02] Query executed: 1 rows returned
 [2024-07-15 14:32:03] Insights generated
 ```
-
----
-
-## License
-
-See [LICENSE](LICENSE) for details.
