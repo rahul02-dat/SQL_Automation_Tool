@@ -1,189 +1,138 @@
 """
-agents/schema_agent.py  —  Schema RAG (Step 1 upgrade)
+agents/schema_agent.py
+----------------------
+SchemaAgent with RAG-lite dynamic schema injection.
 
-Changes from original:
-- Added SchemaRAG inner-class that embeds each table's schema text using
-  sentence-transformers/all-MiniLM-L6-v2 (runs fully locally, ~80 MB).
-- SchemaAgent.build_index() must be called once after extract() to build the
-  FAISS-style cosine index (pure NumPy, no FAISS dependency needed).
-- SchemaAgent.retrieve(query, top_k=4) returns only the top-k most relevant
-  table schemas as a single formatted string.
-- format_schema() is kept unchanged so the full schema can still be saved
-  to output/schema.txt for debugging.
+filter_schema() scores every table in the schema against the user's query
+using lightweight keyword matching (table names, column names, synonyms)
+and returns only the top-N most relevant tables, dramatically shrinking
+the context window fed to the LLM.
 """
 
-from __future__ import annotations
-
-import numpy as np
+import re
 from utils.prompt_compiler import PromptCompiler
 
+# Maximum number of tables to inject into the LLM prompt
+MAX_RELEVANT_TABLES = 5
 
-# ---------------------------------------------------------------------------
-# Optional import — graceful fallback if sentence-transformers isn't installed
-# ---------------------------------------------------------------------------
-try:
-    from sentence_transformers import SentenceTransformer
-    _ST_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _ST_AVAILABLE = False
-
-
-class SchemaRAG:
-    """
-    Lightweight RAG index over table schemas.
-
-    Each table is represented as a short text blob:
-        "TABLE customers COLUMNS customer_id INTEGER, name TEXT, ..."
-
-    At query time we embed the user query with the same model and return the
-    top-k tables by cosine similarity.
-    """
-
-    EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-
-    def __init__(self, logger):
-        self.logger = logger
-        self._model = None
-        self._table_texts: list[str] = []      # one entry per table
-        self._table_meta: list[dict] = []      # raw table dicts from schema_metadata
-        self._embeddings: np.ndarray | None = None  # shape (n_tables, dim)
-
-    # ------------------------------------------------------------------
-    # Index building
-    # ------------------------------------------------------------------
-
-    def build(self, schema_metadata: dict) -> None:
-        """Embed every table and store vectors in memory."""
-        if not _ST_AVAILABLE:
-            self.logger.log_system(
-                "sentence-transformers not installed — Schema RAG disabled, "
-                "falling back to full-schema injection."
-            )
-            return
-
-        self._model = SentenceTransformer(self.EMBED_MODEL)
-        self._table_meta = schema_metadata.get("tables", [])
-        self._table_texts = [self._table_to_text(t) for t in self._table_meta]
-
-        if not self._table_texts:
-            return
-
-        self._embeddings = self._model.encode(
-            self._table_texts,
-            convert_to_numpy=True,
-            normalize_embeddings=True,   # unit vectors → dot product = cosine
-        )
-        self.logger.log_system(
-            f"Schema RAG index built: {len(self._table_texts)} tables embedded."
-        )
-
-    # ------------------------------------------------------------------
-    # Retrieval
-    # ------------------------------------------------------------------
-
-    def retrieve(self, query: str, top_k: int = 4) -> list[dict]:
-        """
-        Return up to top_k table dicts most relevant to *query*.
-        Falls back to all tables if the index is unavailable.
-        """
-        if self._embeddings is None or self._model is None:
-            return self._table_meta          # fallback: return everything
-
-        query_vec = self._model.encode(
-            [query], convert_to_numpy=True, normalize_embeddings=True
-        )[0]                                 # shape (dim,)
-
-        scores = self._embeddings @ query_vec  # cosine similarity for each table
-        top_indices = np.argsort(scores)[::-1][:top_k]
-
-        retrieved = [self._table_meta[i] for i in top_indices]
-        names = [t["name"] for t in retrieved]
-        self.logger.log_system(f"Schema RAG retrieved tables: {names}")
-        return retrieved
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _table_to_text(table: dict) -> str:
-        """Convert a table dict to a short descriptive string for embedding."""
-        col_parts = ", ".join(
-            f"{c['name']} {c['type']}" for c in table.get("columns", [])
-        )
-        fk_parts = ""
-        if table.get("foreign_keys"):
-            fk_strs = [
-                f"{fk['column']} -> {fk['referenced_table']}.{fk['referenced_column']}"
-                for fk in table["foreign_keys"]
-            ]
-            fk_parts = " FK: " + "; ".join(fk_strs)
-        return f"TABLE {table['name']} COLUMNS {col_parts}{fk_parts}"
-
-
-# ---------------------------------------------------------------------------
-# SchemaAgent — public API consumed by main.py and the other agents
-# ---------------------------------------------------------------------------
 
 class SchemaAgent:
     def __init__(self, settings, logger):
-        self.settings = settings
-        self.logger = logger
+        self.settings        = settings
+        self.logger          = logger
         self.prompt_compiler = PromptCompiler(settings.PROMPTS_DIR)
-        self._rag = SchemaRAG(logger)
-        self._schema_metadata: dict = {}
 
-    # ------------------------------------------------------------------
-    # One-time startup methods
-    # ------------------------------------------------------------------
-
+    # ── Schema validation ─────────────────────────────────────────────────────
     def validate_schema(self, schema_metadata: dict) -> bool:
         if not schema_metadata:
-            self.logger.log_system("Schema metadata is empty")
+            self.logger.log_system("Schema metadata is empty.")
             return False
         if "tables" not in schema_metadata or not schema_metadata["tables"]:
-            self.logger.log_system("No tables found in schema")
+            self.logger.log_system("No tables found in schema.")
             return False
         return True
 
-    def build_index(self, schema_metadata: dict) -> None:
+    # ── RAG-lite: keyword relevance filter ────────────────────────────────────
+    def filter_schema(
+        self,
+        schema_metadata: dict,
+        user_query: str,
+        top_n: int = MAX_RELEVANT_TABLES,
+    ) -> dict:
         """
-        Call this once after extract() and validate_schema().
-        Stores metadata and builds the RAG embedding index.
+        Score each table in *schema_metadata* by how many of its names
+        (table name + column names) appear as substrings in *user_query*.
+        Return a filtered schema dict containing only the top-*top_n* tables.
+
+        Scoring heuristic (higher = more relevant):
+          +3  table name found in query
+          +2  column name found in query
+          +1  partial token overlap (≥4 chars) between query tokens and names
+          +5  bonus if query token is a known relational word for a table
+              (e.g. "order" → orders table, "customer" → customers table)
         """
-        self._schema_metadata = schema_metadata
-        self._rag.build(schema_metadata)
+        if not schema_metadata.get("tables"):
+            return schema_metadata
 
-    # ------------------------------------------------------------------
-    # Per-query retrieval (used by IntentAgent and SQLAgent)
-    # ------------------------------------------------------------------
+        query_lower   = user_query.lower()
+        # Tokenise: split on non-alphanumeric characters, keep tokens ≥ 3 chars
+        query_tokens  = set(re.split(r"[^a-z0-9]", query_lower))
+        query_tokens  = {t for t in query_tokens if len(t) >= 3}
 
-    def get_relevant_schema(self, query: str, top_k: int = 4) -> str:
-        """
-        Return a formatted schema string containing only the top-k tables
-        most relevant to *query*.  This is what gets injected into LLM prompts.
-        """
-        relevant_tables = self._rag.retrieve(query, top_k=top_k)
-        return self._format_tables(relevant_tables)
+        scored_tables = []
 
-    # ------------------------------------------------------------------
-    # Full schema (kept for file-saving / debugging)
-    # ------------------------------------------------------------------
+        for table in schema_metadata["tables"]:
+            score      = 0
+            table_name = table["name"].lower()
 
+            # ── Table-name match ──────────────────────────────────────────────
+            if table_name in query_lower:
+                score += 3
+
+            # Singular/plural fuzzy bonus (e.g. "order" matches "orders")
+            for token in query_tokens:
+                # exact token == table name or table name starts with token
+                if table_name == token or table_name.startswith(token):
+                    score += 5
+                    break
+                # partial overlap: token inside table_name (e.g. "item" → "order_items")
+                if token in table_name and len(token) >= 4:
+                    score += 2
+
+            # ── Column-name match ─────────────────────────────────────────────
+            for col in table.get("columns", []):
+                col_name = col["name"].lower()
+                if col_name in query_lower:
+                    score += 2
+                for token in query_tokens:
+                    if col_name == token or col_name.startswith(token):
+                        score += 1
+                        break
+
+            # ── Foreign-key bonus: pull in referenced tables later ────────────
+            # (handled by always including tables referenced from high-score tables)
+
+            scored_tables.append((score, table))
+
+        # Sort descending by score
+        scored_tables.sort(key=lambda x: x[0], reverse=True)
+
+        # Always take at least 1 table; cap at top_n
+        top_tables = [t for _, t in scored_tables[:top_n]]
+
+        # Expand: if a top table has foreign keys, include referenced tables
+        # (up to the hard cap) so JOINs are always possible
+        top_names = {t["name"] for t in top_tables}
+        for table in top_tables[:]:
+            for fk in table.get("foreign_keys", []):
+                ref = fk.get("referenced_table", "")
+                if ref and ref not in top_names and len(top_tables) < top_n + 2:
+                    for _, candidate in scored_tables:
+                        if candidate["name"] == ref:
+                            top_tables.append(candidate)
+                            top_names.add(ref)
+                            break
+
+        included_names = [t["name"] for t in top_tables]
+        self.logger.log_system(
+            f"RAG-lite schema filter: {len(top_tables)}/{len(schema_metadata['tables'])} "
+            f"tables selected → {included_names}"
+        )
+
+        return {"tables": top_tables}
+
+    # ── Schema formatting (unchanged from original) ───────────────────────────
     def format_schema(self, schema_metadata: dict) -> str:
-        """Return the complete schema as a human-readable string."""
-        return self._format_tables(schema_metadata.get("tables", []))
+        lines = [
+            "DATABASE SCHEMA",
+            "=" * 50,
+            "",
+        ]
 
-    # ------------------------------------------------------------------
-    # Internal formatter (shared by both methods above)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _format_tables(tables: list[dict]) -> str:
-        lines = ["DATABASE SCHEMA", "=" * 50, ""]
-        for table in tables:
+        for table in schema_metadata.get("tables", []):
             lines.append(f"TABLE: {table['name']}")
             lines.append("-" * 50)
+
             for column in table.get("columns", []):
                 col_info = f"  {column['name']} ({column['type']})"
                 if column.get("primary_key"):
@@ -191,13 +140,15 @@ class SchemaAgent:
                 if column.get("nullable") is False:
                     col_info += " [NOT NULL]"
                 lines.append(col_info)
+
             if table.get("foreign_keys"):
                 lines.append("")
                 lines.append("  Foreign Keys:")
                 for fk in table["foreign_keys"]:
                     lines.append(
-                        f"    {fk['column']} -> "
-                        f"{fk['referenced_table']}.{fk['referenced_column']}"
+                        f"    {fk['column']} → {fk['referenced_table']}.{fk['referenced_column']}"
                     )
+
             lines.append("")
+
         return "\n".join(lines)

@@ -1,210 +1,201 @@
 """
-agents/sql_agent.py  —  Step 1 (Schema RAG) + Step 2 (AST Security) upgrade
+agents/sql_agent.py
+-------------------
+Unified agent that performs intent classification AND SQL generation in a
+single Ollama call.  Uses the async Ollama client for non-blocking I/O.
 
-Step 1 changes:
-- __init__ no longer accepts a static schema_text string.
-- generate_sql() accepts a *schema_agent* reference and calls
-  schema_agent.get_relevant_schema(user_input) to inject only relevant tables.
-
-Step 2 changes:
-- After the LLM produces a query, _validate_ast() parses it with sqlglot.
-- Any statement whose AST root is NOT a SELECT is rejected before execution.
-- This replaces the fragile English-keyword blocking in IntentClassifier that
-  caused false positives (e.g. "When did John *create* his account?").
-- fix_query() also runs the repaired query through the same AST check.
+LLM output contract (JSON):
+{
+  "classification": "VALID" | "INCOMPLETE" | "DISALLOWED",
+  "reason": "...",
+  "question": "...",          // only when INCOMPLETE
+  "queries": [                // only when VALID
+    {
+      "sql":    "SELECT ...",
+      "params": ["value1", "value2"]   // parameterized values, in order
+    }
+  ]
+}
 """
 
-from __future__ import annotations
+import json
+import asyncio
+from pathlib import Path
 
-import ollama
+try:
+    from ollama import AsyncClient
+except ImportError:                          # graceful degradation during tests
+    AsyncClient = None
+
 from utils.prompt_compiler import PromptCompiler
 
-# ---------------------------------------------------------------------------
-# Optional sqlglot import — graceful fallback if not installed
-# ---------------------------------------------------------------------------
-try:
-    import sqlglot
-    import sqlglot.expressions as exp
-    _SQLGLOT_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    _SQLGLOT_AVAILABLE = False
+
+_SYSTEM_PROMPT = """\
+You are a precise SQL expert agent.
+Your ONLY job is to classify the user's intent and, when valid, produce
+safe, read-only SELECT queries against the provided database schema.
+
+RULES:
+1. Output ONLY valid JSON — no markdown fences, no prose, no comments.
+2. Never generate INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE,
+   GRANT, REVOKE, or any DDL/DML statement.
+3. Use parameterized placeholders (?) for every literal value the user
+   supplies (names, dates, numbers, etc.).  Collect the corresponding
+   values in the "params" array in the same order.
+4. If the request is ambiguous or lacks necessary context, set
+   classification to INCOMPLETE and provide a helpful clarifying question.
+5. If the request violates the policies, set classification to DISALLOWED.
+"""
 
 
 class SQLAgent:
+    """
+    Unified Intent + SQL agent.
+
+    Replaces the old separate IntentAgent + SQLAgent pair with a single
+    async LLM call that returns a structured JSON object.
+    """
+
     def __init__(self, settings, logger):
-        self.settings = settings
-        self.logger = logger
+        self.settings       = settings
+        self.logger         = logger
         self.prompt_compiler = PromptCompiler(settings.PROMPTS_DIR)
+        self._client        = AsyncClient(host=settings.OLLAMA_BASE_URL) if AsyncClient else None
 
-        if not _SQLGLOT_AVAILABLE:
-            self.logger.log_system(
-                "sqlglot not installed — AST validation disabled. "
-                "Install with: pip install sqlglot"
-            )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def generate_sql(self, user_input: str, intent_result: dict, schema_agent) -> list[str]:
+    # ── Main entry: intent classification + SQL generation ────────────────────
+    async def generate_async(
+        self,
+        user_input: str,
+        schema_text: str,
+        chat_history: list[dict],
+    ) -> dict | None:
         """
-        Generate and return validated SELECT queries.
+        Single async LLM call.
+        Returns the parsed JSON dict, or None on unrecoverable error.
 
-        Parameters
-        ----------
-        schema_agent : SchemaAgent
-            Live instance; we call get_relevant_schema() for focused context.
+        chat_history is a list of {"user": "...", "sql": "..."} dicts
+        representing recent conversation turns.
         """
-        # --- Schema RAG: inject only relevant tables -----------------------
-        relevant_schema = schema_agent.get_relevant_schema(user_input, top_k=4)
-
         prompt = self.prompt_compiler.compile_sql_prompt(
-            user_input, relevant_schema, intent_result
+            user_input    = user_input,
+            schema_text   = schema_text,
+            intent_result = {},              # not needed — intent is embedded
+            chat_history  = chat_history,
         )
 
-        try:
-            response = ollama.chat(
-                model=self.settings.OLLAMA_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            sql_text = response["message"]["content"].strip()
-            raw_queries = self._extract_queries(sql_text)
-
-            # --- Step 2: AST validation ------------------------------------
-            safe_queries = []
-            for q in raw_queries:
-                validation = self._validate_ast(q)
-                if validation["valid"]:
-                    safe_queries.append(q)
-                else:
-                    self.logger.log_system(
-                        f"AST validation blocked query: {validation['reason']}"
-                    )
-
-            self.logger.log_system(
-                f"Generated {len(raw_queries)} queries, "
-                f"{len(safe_queries)} passed AST validation."
-            )
-            return safe_queries
-
-        except Exception as e:
-            self.logger.log_system(f"SQL generation error: {str(e)}")
-            return []
-
-    def fix_query(self, query: str, error_message: str) -> str | None:
-        """Ask the LLM to repair a failing query, then re-validate via AST."""
-        prompt = (
-            f"The following SQL query resulted in an error:\n\n"
-            f"QUERY:\n{query}\n\n"
-            f"ERROR:\n{error_message}\n\n"
-            "Please fix the query to resolve this error. "
-            "Return ONLY the corrected SQL query without any explanation.\n\n"
-            "CORRECTED QUERY:"
-        )
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ]
 
         try:
-            response = ollama.chat(
-                model=self.settings.OLLAMA_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+            response = await self._client.chat(
+                model    = self.settings.OLLAMA_MODEL,
+                messages = messages,
+                options  = {"temperature": 0.0},   # deterministic output
             )
-            fixed_sql = response["message"]["content"].strip()
-            queries = self._extract_queries(fixed_sql)
+            raw = response["message"]["content"].strip()
+            self.logger.log_system("LLM response received (intent+SQL).")
+            return self._parse_json_response(raw)
 
-            if not queries:
-                return None
-
-            fixed = queries[0]
-
-            # Re-validate the repaired query
-            validation = self._validate_ast(fixed)
-            if not validation["valid"]:
-                self.logger.log_system(
-                    f"Repaired query failed AST validation: {validation['reason']}"
-                )
-                return None
-
-            self.logger.log_system("Query fixed and validated successfully")
-            return fixed
-
-        except Exception as e:
-            self.logger.log_system(f"Query fix error: {str(e)}")
+        except Exception as exc:
+            self.logger.log_system(f"LLM call error (generate_async): {exc}")
             return None
 
-    # ------------------------------------------------------------------
-    # Step 2: AST-based security validation
-    # ------------------------------------------------------------------
-
-    def _validate_ast(self, query: str) -> dict:
+    # ── Self-healing: fix a failed query ─────────────────────────────────────
+    async def fix_query_async(
+        self,
+        original_sql: str,
+        error_history: list[str],
+    ) -> tuple[str, list] | None:
         """
-        Parse *query* with sqlglot and reject anything that is not a SELECT.
-
-        Returns
-        -------
-        dict with keys:
-            valid  : bool
-            reason : str   (empty string when valid)
+        Ask the LLM to fix *original_sql* given the accumulated *error_history*.
+        Returns (fixed_sql, params) or None.
         """
-        if not _SQLGLOT_AVAILABLE:
-            # Can't validate — allow through (rely on DB read-only mode as
-            # the last line of defence)
-            return {"valid": True, "reason": ""}
+        errors_block = "\n".join(f"  - {e}" for e in error_history)
+        prompt = (
+            "The following SQL query failed. Fix it so it executes correctly.\n\n"
+            f"ORIGINAL QUERY:\n{original_sql}\n\n"
+            f"ERRORS (in order of attempts):\n{errors_block}\n\n"
+            "RULES:\n"
+            "  • Return ONLY valid JSON — no markdown, no prose.\n"
+            "  • Use parameterized placeholders (?) for all literal values.\n"
+            "  • Output format:\n"
+            '    {"sql": "SELECT ...", "params": ["val1", "val2"]}\n'
+            "  • The query must be a SELECT statement only.\n"
+        )
+
+        messages = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ]
 
         try:
-            statements = sqlglot.parse(query)
-        except sqlglot.errors.ParseError as exc:
-            return {"valid": False, "reason": f"SQL parse error: {exc}"}
+            response = await self._client.chat(
+                model    = self.settings.OLLAMA_MODEL,
+                messages = messages,
+                options  = {"temperature": 0.0},
+            )
+            raw = response["message"]["content"].strip()
+            data = self._safe_json(raw)
+            if data and "sql" in data:
+                fixed_sql = data["sql"].strip().rstrip(";")
+                params    = data.get("params", [])
+                self.logger.log_system("Query fixed by LLM.")
+                return fixed_sql, params
+            return None
 
-        if not statements:
-            return {"valid": False, "reason": "No SQL statement found in LLM output"}
+        except Exception as exc:
+            self.logger.log_system(f"LLM call error (fix_query_async): {exc}")
+            return None
 
-        for stmt in statements:
-            if stmt is None:
-                continue
-            # The root expression type determines the statement kind.
-            if not isinstance(stmt, exp.Select):
-                blocked_type = type(stmt).__name__
-                return {
-                    "valid": False,
-                    "reason": (
-                        f"Non-SELECT statement blocked by AST validator: "
-                        f"{blocked_type}"
-                    ),
-                }
+    # ── JSON helpers ──────────────────────────────────────────────────────────
+    def _parse_json_response(self, raw: str) -> dict | None:
+        """
+        Parse the LLM's JSON response.
+        Strips accidental markdown fences before parsing.
+        """
+        data = self._safe_json(raw)
+        if data is None:
+            self.logger.log_system(
+                f"Could not parse LLM JSON. Raw output:\n{raw[:300]}"
+            )
+            # Degrade gracefully — treat as INCOMPLETE
+            return {
+                "classification": "INCOMPLETE",
+                "reason": "LLM returned unparseable output.",
+                "question": "Could not understand your request. Please rephrase.",
+                "queries": [],
+            }
 
-        return {"valid": True, "reason": ""}
+        # Normalise queries list: strip semicolons from SQL
+        for q in data.get("queries", []):
+            if "sql" in q:
+                q["sql"] = q["sql"].strip().rstrip(";")
+            if "params" not in q:
+                q["params"] = []
 
-    # ------------------------------------------------------------------
-    # SQL extraction (unchanged from original)
-    # ------------------------------------------------------------------
+        return data
 
-    def _extract_queries(self, text: str) -> list[str]:
-        queries = []
-        lines = text.split("\n")
-        current_query: list[str] = []
-
-        for line in lines:
-            stripped = line.strip()
-            if not stripped or stripped.startswith("```"):
-                continue
-
-            if stripped.upper().startswith("SELECT"):
-                if current_query:
-                    q = " ".join(current_query)
-                    if q:
-                        queries.append(q)
-                    current_query = []
-                current_query.append(stripped)
-            elif current_query:
-                current_query.append(stripped)
-                if stripped.endswith(";"):
-                    q = " ".join(current_query)
-                    if q:
-                        queries.append(q.rstrip(";"))
-                    current_query = []
-
-        if current_query:
-            q = " ".join(current_query)
-            if q:
-                queries.append(q.rstrip(";"))
-
-        return queries
+    @staticmethod
+    def _safe_json(text: str) -> dict | None:
+        """Strip markdown fences then attempt JSON parse."""
+        # Remove ```json ... ``` or ``` ... ``` wrappers
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.split("\n")
+            # Drop first and last fence lines
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            cleaned = "\n".join(lines).strip()
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            # Try to extract the first {...} block
+            start = cleaned.find("{")
+            end   = cleaned.rfind("}") + 1
+            if start != -1 and end > start:
+                try:
+                    return json.loads(cleaned[start:end])
+                except json.JSONDecodeError:
+                    pass
+        return None
